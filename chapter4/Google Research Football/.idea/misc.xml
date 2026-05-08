@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="SSH (sftp://root@connect.nmb2.seetacloud.com:26037/root/miniconda3/bin/python)" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="SSH (sftp://root@connect.nmb2.seetacloud.com:26037/root/miniconda3/bin/python)" project-jdk-type="Python SDK" />
+</project>

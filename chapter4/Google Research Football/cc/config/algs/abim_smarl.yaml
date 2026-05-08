@@ -1,0 +1,47 @@
+# --- ABIM-SMARL 核心算法配置 ---
+name: "abim_smarl"
+
+mac: "abim_mac"
+agent: "abim_agent"
+mixer: "abim_mixer"
+learner: "abim_learner"
+runner: "episode"
+
+action_selector: "epsilon_greedy"
+agent_output_type: "q"
+
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+# 🌟 优化：纠正超参数倒挂，将内在动机权重从 1.0 大幅下调
+intrinsic_beta: 0.05
+inverse_lambda: 0.5
+attn_heads: 4
+embed_dim: 64
+hypernet_hidden: 64
+rnn_hidden_dim: 64
+entity_feat_dim: 2
+num_entities: 13
+
+action_dims_list:
+  - 19
+
+lr: 0.0001
+critic_lr: 0.0005
+target_update_interval: 500
+gamma: 0.99
+grad_norm_clip: 1.0
+batch_size_run: 1
+batch_size: 64
+buffer_size: 5000
+
+use_AEM: False
+use_emdqn: False
+memory_emb_type: 3
+td_lambda: 0.6
+emb_training_batch: 1024
+emb_training_mini_batch: 128
+ec_buffer_stats_update_interval: 200
+ec_buffer_embedder_update_interval: 10000
+t_EC_update: 0
