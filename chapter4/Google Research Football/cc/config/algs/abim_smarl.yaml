@@ -1,4 +1,4 @@
-# --- ABIM-SMARL 核心算法配置 ---
+# --- ABIM-SMARL  ---
 name: "abim_smarl"
 
 mac: "abim_mac"
@@ -14,7 +14,7 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
-# 🌟 优化：纠正超参数倒挂，将内在动机权重从 1.0 大幅下调
+
 intrinsic_beta: 0.05
 inverse_lambda: 0.5
 attn_heads: 4
