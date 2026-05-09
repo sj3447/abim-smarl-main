@@ -53,7 +53,6 @@ class SequentialActionDecoder(nn.Module):
             if teacher_forcing_actions is not None:
                 chosen_idx = teacher_forcing_actions[:, step].long()
             else:
-                # 统一探索逻辑
                 if random.random() < epsilon:
                     chosen_idx = torch.randint(0, self.action_dims_list[step], (b,), device=device)
                 else:
@@ -63,7 +62,6 @@ class SequentialActionDecoder(nn.Module):
             a_t_onehot = F.one_hot(chosen_idx, num_classes=self.action_dims_list[step]).float()
             macro_action_components.append(a_t_onehot)
 
-            # 准备下一步的输入
             a_t_prev = torch.zeros(b, self.total_action_dim, device=device)
             start_idx = sum(self.action_dims_list[:step])
             a_t_prev[:, start_idx: start_idx + self.action_dims_list[step]] = a_t_onehot
@@ -87,7 +85,6 @@ class ABIMAgent(nn.Module):
 
     def forward(self, inputs, hidden_state, teacher_forcing_actions=None, epsilon=0.0):
         b = inputs.shape[0]
-        # 26维切片逻辑
         obs_dim = self.args.num_entities * self.args.entity_feat_dim
         entities = inputs[:, :obs_dim].reshape(b, self.args.num_entities, self.args.entity_feat_dim)
 
