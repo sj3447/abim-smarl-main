@@ -4,7 +4,7 @@ from .basic_controller import BasicMAC
 
 class ABIMMAC(BasicMAC):
     def select_actions(self, ep_batch, t_ep, t_env, bs=None, test_mode=False):
-        # 🌟 核心修复：手动让 epsilon 随环境步数 t_env 衰减
+        # 手动让 epsilon 随环境步数 t_env 衰减
         if hasattr(self.action_selector, "schedule"):
             self.action_selector.epsilon = self.action_selector.schedule.eval(t_env)
 
@@ -21,7 +21,7 @@ class ABIMMAC(BasicMAC):
         agent_inputs = self._build_inputs(ep_batch, t)
         bs = ep_batch.batch_size
 
-        # 2. 核心修复：将 2D 平铺张量转换为 3D [bs, n_agents, feature] 以便按智能体索引
+        # 2. 将 2D 平铺张量转换为 3D [bs, n_agents, feature] 以便按智能体索引
         agent_inputs = agent_inputs.view(bs, self.n_agents, -1)
         # hidden_states 同样需要 view 为 [bs, n_agents, hidden_dim]
         h_states = self.hidden_states.view(bs, self.n_agents, -1)
