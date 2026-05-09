@@ -74,7 +74,6 @@ class ABIMLearner:
 
         loss_seq_align, loss_representation = 0.0, 0.0
 
-        # 🌟 优化 1：单独收集每个智能体的内在奖励，杜绝全局平均
         ind_int_rewards_list = []
 
         for i in range(self.args.n_agents):
@@ -89,7 +88,6 @@ class ABIMLearner:
 
             phi_next_pred, action_pred, int_reward = self.intrinsic_mods[i](phi_t, phi_next, act_i_flat)
 
-            # 记录独立的好奇心数值 (B, T-1, 1)
             ind_int_rewards_list.append(int_reward)
 
             loss_representation += F.mse_loss(phi_next_pred, phi_next) + \
@@ -114,7 +112,6 @@ class ABIMLearner:
                     micro_q_chosen = agent_micro_q.gather(1, act_target_idx).squeeze(-1)
                     loss_seq_align += F.mse_loss(micro_q_chosen, top_q_val[:, t])
 
-        # 拼接成张量 (B, T-1, n_agents)
         ind_int_rewards = torch.cat(ind_int_rewards_list, dim=-1)
 
         with torch.no_grad():
@@ -129,19 +126,14 @@ class ABIMLearner:
         with torch.no_grad():
             q_tot_target = self.target_mixer(target_mac_out, batch["state"][:, 1:])
 
-        # 🌟 优化 2：纯净的外部 TD Target，Mixer 仅拟合团队真实得分
         td_target = rewards + self.args.gamma * (1 - terminated) * q_tot_target
         td_error = (q_tot_current - td_target.detach())
         masked_td_error = td_error * mask
         loss_critic = (masked_td_error ** 2).sum() / mask.sum()
 
-        # 🌟 优化 3：个体 Q 值整形 (Individual Q-Shaping)
-        # 用各自产生的内在奖励直接乘以自己的 Q 值并取负。
-        # 优化器在最小化该 Loss 时，会自动推高那些好奇心强的智能体的动作 Q 值，实现精准个体激励。
         masked_mac_out = mac_out[:, :-1] * mask
         loss_intrinsic_drive = - (masked_mac_out * ind_int_rewards.detach()).sum() / mask.sum()
 
-        # 整体损失合成
         total_loss = loss_critic + self.args.intrinsic_beta * loss_intrinsic_drive + \
                      loss_seq_align / (batch.max_seq_length * self.args.n_agents) + loss_representation
 
@@ -166,7 +158,6 @@ class ABIMLearner:
             self.logger.log_stat("q_taken_mean", (q_tot_current * mask).sum().item() / mask_elems, t_env)
             self.logger.log_stat("target_mean", (td_target * mask).sum().item() / mask_elems, t_env)
 
-            # 记录独立好奇心的平均水平
             self.logger.log_stat("intrinsic_rewards_mean",
                                  (ind_int_rewards * mask).sum().item() / (mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
