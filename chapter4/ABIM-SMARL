@@ -1,0 +1,383 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import copy
+import numpy as np
+import random
+
+# =====================================================================
+# 模块一: 多头自注意力状态编码器
+# =====================================================================
+class AttentionBottleneckEncoder(nn.Module):
+    """
+    多头自注意力状态编码器
+    利用单向信息瓶颈滤除冗余实体噪声，提取高信噪比的战术语义表征。
+    """
+    def __init__(self, entity_feat_dim, embed_dim, num_heads=4):
+        super(AttentionBottleneckEncoder, self).__init__()
+        self.embed_dim = embed_dim
+
+        # 实体特征高维映射
+        self.entity_proj = nn.Linear(entity_feat_dim, embed_dim)
+
+        # 多头自注意力模块 (batch_first=True 适配张量流)
+        self.mhsa = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+
+    def forward(self, entities, pad_mask=None):
+        """
+        entities: (batch_size, num_entities, entity_feat_dim)，索引 0 通常为 Ego-Agent
+        pad_mask: 用于屏蔽零填充的无效实体
+        """
+        x = F.relu(self.entity_proj(entities))
+
+        # 信息瓶颈：强制限定 Query 仅为智能体自身实体特征 (batch_size, 1, embed_dim)
+        query = x[:, 0:1, :]
+        key = x
+        value = x
+
+        attn_out, attn_weights = self.mhsa(query, key, value, key_padding_mask=pad_mask)
+
+        # 残差连接与层归一化
+        out = self.layer_norm(query + attn_out)
+        out = out + self.ffn(out)
+
+        # 压缩序列维度，输出态势表征 (batch_size, embed_dim)
+        phi_repr = out.squeeze(1)
+        return phi_repr, attn_weights
+
+# =====================================================================
+# 模块二: 基于纯净表征的内在动机模块
+# =====================================================================
+class IntrinsicMotivationModule(nn.Module):
+    """
+    内在动机模块 (ICM)
+    在隐空间内计算前向与逆向动力学误差，生成探索奖励以规避“嘈杂电视”效应。
+    """
+    def __init__(self, repr_dim, action_dim, hidden_dim=128):
+        super(IntrinsicMotivationModule, self).__init__()
+
+        # 前向动力学模型：预测下一帧注意力表征
+        self.forward_model = nn.Sequential(
+            nn.Linear(repr_dim + action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, repr_dim)
+        )
+
+        # 逆向动力学模型：反推执行动作，作为表征学习的正则化约束
+        self.inverse_model = nn.Sequential(
+            nn.Linear(repr_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+    def forward(self, phi_t, phi_next, action_t):
+        fwd_input = torch.cat([phi_t, action_t], dim=-1)
+        phi_next_pred = self.forward_model(fwd_input)
+
+        inv_input = torch.cat([phi_t, phi_next], dim=-1)
+        action_pred = self.inverse_model(inv_input)
+
+        # 计算前向预测 MSE 作为内在探索奖励，切断梯度传递
+        with torch.no_grad():
+            intrinsic_reward = F.mse_loss(
+                phi_next_pred, phi_next, reduction='none'
+            ).mean(dim=-1, keepdim=True)
+
+        return phi_next_pred, action_pred, intrinsic_reward
+
+# =====================================================================
+# 模块三: 分布式混合动作序贯执行网络
+# =====================================================================
+class SequentialActionDecoder(nn.Module):
+    """
+    分布式混合动作序贯执行网络 (Sequential DQN Architecture)
+    采用自回归架构，将高维混合动作张量降维为序列化的微观决策流。
+    """
+    def __init__(self, repr_dim, action_dims_list, hidden_dim=128):
+        super(SequentialActionDecoder, self).__init__()
+        self.action_dims_list = action_dims_list
+        self.num_components = len(action_dims_list)
+        self.total_action_dim = sum(action_dims_list)
+
+        # 顶层宏观 Q 网络：评估完整联合战术动作的最终价值
+        self.top_macro_q_net = nn.Sequential(
+            nn.Linear(repr_dim + self.total_action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+        # 底层序贯上下文网络：基于 GRU 记忆内部决策步骤的历史状态
+        self.gru_context = nn.GRUCell(input_size=self.total_action_dim, hidden_size=hidden_dim)
+
+        # 各微观动作分量的独立 Q 值推断头
+        self.micro_q_heads = nn.ModuleList([
+            nn.Linear(repr_dim + hidden_dim, action_dim)
+            for action_dim in action_dims_list
+        ])
+
+    def forward(self, phi, teacher_forcing_actions=None, epsilon=0.0):
+        batch_size = phi.size(0)
+        device = phi.device
+
+        micro_q_outputs = []
+        macro_action_components = []
+        macro_action_indices = []
+
+        h_t = torch.zeros(batch_size, self.gru_context.hidden_size, device=device)
+        a_t_prev = torch.zeros(batch_size, self.total_action_dim, device=device)
+
+        # 展开内部自回归决策链
+        for step in range(self.num_components):
+            # 1. 更新 GRU 隐状态
+            h_t = self.gru_context(a_t_prev, h_t)
+
+            # 2. 推断当前维度的可选 Q 值
+            joint_context = torch.cat([phi, h_t], dim=-1)
+            q_micro = self.micro_q_heads[step](joint_context)
+            micro_q_outputs.append(q_micro)
+
+            # 3. 确定当前维度的动作索引
+            if teacher_forcing_actions is not None:
+                # 集中训练时使用真实样本(Teacher Forcing)
+                chosen_idx = teacher_forcing_actions[:, step]
+            else:
+                # 在线执行时应用 Epsilon-Greedy
+                if random.random() < epsilon:
+                    chosen_idx = torch.randint(
+                        0, self.action_dims_list[step], (batch_size,), device=device
+                    )
+                else:
+                    chosen_idx = q_micro.argmax(dim=-1)
+
+            macro_action_indices.append(chosen_idx.unsqueeze(1))
+
+            # 转换为 One-hot 编码用于下一步的输入对齐
+            a_t_onehot = F.one_hot(chosen_idx, num_classes=self.action_dims_list[step]).float()
+            macro_action_components.append(a_t_onehot)
+
+            a_t_prev = torch.zeros(batch_size, self.total_action_dim, device=device)
+            start_idx = sum(self.action_dims_list[:step])
+            a_t_prev[:, start_idx : start_idx + self.action_dims_list[step]] = a_t_onehot
+
+        # 拼接高维动作张量及索引
+        macro_action_tensor = torch.cat(macro_action_components, dim=-1)
+        macro_action_idx_tensor = torch.cat(macro_action_indices, dim=-1)
+
+        # 评估战术动作序列的闭环价值
+        top_macro_q_val = self.top_macro_q_net(torch.cat([phi, macro_action_tensor], dim=-1))
+
+        return micro_q_outputs, macro_action_tensor, macro_action_idx_tensor, top_macro_q_val
+
+# =====================================================================
+# 模块四: 基于动态权重的集中式信用分配网络
+# =====================================================================
+class AttentionMixingNetwork(nn.Module):
+    """
+    动态混合集中式评价器 (AIRMN)
+    依据全局态势动态生成非负混合权重，融合局部动作价值，保障 IGM 单调一致性。
+    """
+    def __init__(self, num_agents, global_state_dim, embed_dim=64, hypernet_hidden=64):
+        super(AttentionMixingNetwork, self).__init__()
+        self.num_agents = num_agents
+        self.embed_dim = embed_dim
+
+        # 提取全局态势超特征
+        self.hyper_feat_extractor = nn.Sequential(
+            nn.Linear(global_state_dim, hypernet_hidden),
+            nn.ReLU(),
+            nn.Linear(hypernet_hidden, hypernet_hidden),
+            nn.ReLU()
+        )
+
+        # 第一层网络权重与偏置生成器
+        self.hyper_w_1 = nn.Linear(hypernet_hidden, embed_dim * num_agents)
+        self.hyper_b_1 = nn.Linear(hypernet_hidden, embed_dim)
+
+        # 第二层网络权重与偏置生成器
+        self.hyper_w_2 = nn.Linear(hypernet_hidden, embed_dim)
+        self.hyper_b_2 = nn.Sequential(
+            nn.Linear(hypernet_hidden, hypernet_hidden),
+            nn.ReLU(),
+            nn.Linear(hypernet_hidden, 1)
+        )
+
+    def forward(self, local_q_values, global_state):
+        batch_size = local_q_values.size(0)
+        hyper_feats = self.hyper_feat_extractor(global_state)
+
+        # 第一层聚合：利用 torch.abs() 施加非负约束，保障单调递增性
+        w1 = torch.abs(self.hyper_w_1(hyper_feats)).view(batch_size, self.num_agents, self.embed_dim)
+        b1 = self.hyper_b_1(hyper_feats).view(batch_size, 1, self.embed_dim)
+        hidden = F.elu(torch.bmm(local_q_values, w1) + b1)
+
+        # 第二层聚合
+        w2 = torch.abs(self.hyper_w_2(hyper_feats)).view(batch_size, self.embed_dim, 1)
+        b2 = self.hyper_b_2(hyper_feats).view(batch_size, 1, 1)
+        q_tot = torch.bmm(hidden, w2) + b2
+
+        return q_tot.view(batch_size, -1)
+
+# =====================================================================
+# 端到端统筹优化器与损失合并
+# =====================================================================
+class ABIMSMARLLossHandler:
+    def __init__(self, intrinsic_beta=0.1, inverse_lambda=0.5, gamma=0.99):
+        self.beta = intrinsic_beta    # 内在奖励权重
+        self.lam = inverse_lambda     # 逆向动力学约束系数
+        self.gamma = gamma            # 折扣因子
+
+    def compute_joint_loss(self, batch, encoders, intrinsic_mods, seq_actors, mixing_net,
+                           target_seq_actors, target_mixing_net):
+        obs, actions, actions_idx, ext_rewards, next_obs, dones, global_s, next_global_s = batch
+        B, num_agents, num_entities, entity_dim = obs.shape
+
+        local_top_q = []
+        target_local_top_q = []
+        loss_seq_align = 0.0
+        loss_representation = 0.0
+        batch_intrinsic_rewards = torch.zeros((B, 1), device=obs.device)
+
+        # 并发计算各智能体的局部损失
+        for i in range(num_agents):
+            # 1. 状态编码
+            phi_t, _ = encoders[i](obs[:, i, :, :])
+            phi_next, _ = encoders[i](next_obs[:, i, :, :])
+
+            # 2. 计算内在奖励与表征损失
+            phi_next_pred, action_pred, int_reward = intrinsic_mods[i](
+                phi_t, phi_next, actions[:, i, :]
+            )
+            batch_intrinsic_rewards += int_reward
+
+            loss_representation += F.mse_loss(phi_next_pred, phi_next.detach()) + \
+                                   self.lam * F.mse_loss(action_pred, actions[:, i, :])
+
+            # 3. 序贯网络执行与微观价值对齐
+            micro_q_list, _, _, top_q_val = seq_actors[i](
+                phi_t, teacher_forcing_actions=actions_idx[:, i, :]
+            )
+            local_top_q.append(top_q_val)
+
+            for step_idx, micro_q in enumerate(micro_q_list):
+                act_target_idx = actions_idx[:, i, step_idx].unsqueeze(1)
+                micro_q_chosen = micro_q.gather(1, act_target_idx)
+                loss_seq_align += F.mse_loss(micro_q_chosen, top_q_val.detach())
+
+            # 4. Target 网络推断
+            with torch.no_grad():
+                phi_next_tgt, _ = encoders[i](next_obs[:, i, :, :])
+                _, _, _, top_q_tgt = target_seq_actors[i](phi_next_tgt, teacher_forcing_actions=None)
+                target_local_top_q.append(top_q_tgt)
+
+        # 集中式评价器 TD 损失计算
+        local_q_tensor = torch.cat(local_top_q, dim=-1).unsqueeze(1)
+        target_local_q_tensor = torch.cat(target_local_top_q, dim=-1).unsqueeze(1)
+
+        q_tot_current = mixing_net(local_q_tensor, global_s)
+        with torch.no_grad():
+            q_tot_target = target_mixing_net(target_local_q_tensor, next_global_s)
+
+        # 构建包含内外因子的系统总奖励
+        augmented_reward = ext_rewards + self.beta * (batch_intrinsic_rewards / num_agents)
+        td_target = augmented_reward + self.gamma * (1 - dones) * q_tot_target
+
+        loss_critic = F.mse_loss(q_tot_current, td_target.detach())
+
+        # 聚合成最终端到端损失
+        total_unified_loss = loss_critic + loss_seq_align + loss_representation
+        return total_unified_loss
+
+# =====================================================================
+# 算法生命周期执行流调度核心
+# =====================================================================
+class ABIM_SMARL_AgentCore:
+    def __init__(self, num_agents, env_params, lr=1e-4):
+        self.num_agents = num_agents
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        action_dims_list = env_params['action_dims_list']
+        act_total_dim = sum(action_dims_list)
+
+        # 实例化网络模块
+        self.encoders = nn.ModuleList().to(self.device)
+        self.intrinsic_mods = nn.ModuleList([
+            IntrinsicMotivationModule(64, act_total_dim) for _ in range(num_agents)
+        ]).to(self.device)
+        self.seq_actors = nn.ModuleList().to(self.device)
+
+        self.mixing_net = AttentionMixingNetwork(
+            num_agents, env_params['global_state_dim']
+        ).to(self.device)
+
+        # 目标网络参数克隆
+        self.target_seq_actors = copy.deepcopy(self.seq_actors).to(self.device)
+        self.target_mixing_net = copy.deepcopy(self.mixing_net).to(self.device)
+
+        self.params = list(self.encoders.parameters()) + \
+                      list(self.intrinsic_mods.parameters()) + \
+                      list(self.seq_actors.parameters()) + \
+                      list(self.mixing_net.parameters())
+
+        self.optimizer = optim.Adam(self.params, lr=lr, eps=1e-5)
+        self.loss_handler = ABIMSMARLLossHandler()
+
+    def select_actions(self, obs_entities, epsilon=0.1):
+        """在线推断阶段接口"""
+        macro_actions = []
+        action_indices_list = []
+
+        with torch.no_grad():
+            for i in range(self.num_agents):
+                obs_tensor = torch.FloatTensor(obs_entities[i]).unsqueeze(0).to(self.device)
+                phi_i, _ = self.encoders[i](obs_tensor)
+
+                _, macro_action, macro_idx, _ = self.seq_actors[i](phi_i, epsilon=epsilon)
+
+                macro_actions.append(macro_action.squeeze(0).cpu().numpy())
+                action_indices_list.append(macro_idx.squeeze(0).cpu().numpy())
+
+        return macro_actions, action_indices_list
+
+    def train_step(self, replay_buffer, batch_size=32):
+        """离线集中式优化接口"""
+        if replay_buffer.size() < batch_size:
+            return
+
+        batch = replay_buffer.sample(batch_size, self.device)
+        self.optimizer.zero_grad()
+
+        total_loss = self.loss_handler.compute_joint_loss(
+            batch, self.encoders, self.intrinsic_mods, self.seq_actors,
+            self.mixing_net, self.target_seq_actors, self.target_mixing_net
+        )
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.params, max_norm=5.0)
+        self.optimizer.step()
+
+        self._soft_update_targets(tau=0.005)
+
+    def _soft_update_targets(self, tau):
+        """目标网络 EMA 平滑更新"""
+        for target_param, local_param in zip(self.target_seq_actors.parameters(), self.seq_actors.parameters()):
+            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+
+        for target_param, local_param in zip(self.target_mixing_net.parameters(), self.mixing_net.parameters()):
+            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
